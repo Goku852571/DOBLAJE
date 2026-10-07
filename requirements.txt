@@ -1,0 +1,15 @@
+PySide6
+paddlepaddle
+paddleocr
+faster-whisper
+rapidfuzz
+opencv-python
+requests
+httpx
+numpy
+transformers==4.56.0
+torch>=2.2
+sentencepiece
+safetensors
+imageio-ffmpeg
+pywin32

@@ -1,0 +1,17 @@
+.venv/
+.venv312/
+.venv.*/
+__pycache__/
+*.pyc
+.vscode/
+pip-torch.log
+task_output.txt
+*.wav
+models/
+app_packages/
+local_packages/
+.python-packages/
+._config.json
+.project_lock
+config.json
+validation_asr/
