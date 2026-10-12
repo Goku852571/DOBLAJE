@@ -1,8 +1,5 @@
 PySide6
-paddlepaddle
-paddleocr
 faster-whisper
-rapidfuzz
 opencv-python
 requests
 httpx
@@ -13,3 +10,6 @@ sentencepiece
 safetensors
 imageio-ffmpeg
 pywin32
+sherpa-onnx>=1.13.0
+sherpa-onnx-core>=1.13.0
+soundfile==0.13.1

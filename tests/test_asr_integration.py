@@ -36,7 +36,7 @@ class ASRIntegrationTests(unittest.TestCase):
             segment([word(" Three", 5, 6)]),
         ], 10, "en")
         self.assertEqual([s["text"] for s in result], ["One", "Two", "Three"])
-        fused = fuse_segments([], result)
+        fused = fuse_segments(result)
         self.assertEqual([s["source_text"] for s in fused], ["One", "Two", "Three"])
         self.assertEqual([s["asr_text"] for s in fused], ["One", "Two", "Three"])
 

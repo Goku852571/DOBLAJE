@@ -25,7 +25,7 @@ def load_class(path, name, namespace):
 class ManualTranslationTests(unittest.TestCase):
     def setUp(self):
         namespace = dict(QMainWindow=object, List=list, Dict=dict, json=json,
-                         hashlib=hashlib, clear_segment_tts=load_source('media', {}).clear_segment_tts)
+                         hashlib=hashlib, config_manager=SimpleNamespace(get=lambda key, default=None: "manual" if key == "translation_mode" else default), clear_segment_tts=load_source('media', {}).clear_segment_tts)
         cls = load_class('gui/main_window.py', 'MainWindow', namespace)
         self.window = cls.__new__(cls)
         self.window.segments = [
@@ -85,12 +85,37 @@ class ManualTranslationTests(unittest.TestCase):
         translator_module.OllamaTranslator = Mock(side_effect=AssertionError('Ollama called'))
         namespace = dict(QThread=object, Signal=lambda *args: Mock(), List=list,
                          os=__import__('os'), config_manager=SimpleNamespace(
-                             get=lambda key, default=None: False if key == 'ocr_enabled' else default),
+                             get=lambda key, default=None: "faster_whisper" if key == "asr_engine" else default),
                          get_video_info=lambda path: {'has_audio': True}, extract_audio=Mock(return_value=True),
                          fuse_segments=fuse_segments, logger=logging.getLogger('manual_test'))
         worker_cls = load_class('gui/workers.py', 'AnalyzeWorker', namespace)
         worker = worker_cls('video.mp4', manual_translation=True)
         with patch.dict('sys.modules', {'core.asr_engine': asr_module,
+                                       'core.ollama_translator': translator_module}):
+            worker.run()
+        worker.error.emit.assert_not_called()
+        worker.finished.emit.assert_called_once()
+        segments = worker.finished.emit.call_args.args[0]
+        self.assertEqual(segments[0]['source_text'], 'Hello')
+        self.assertEqual(segments[0]['final_text'], '')
+        translator_module.OllamaTranslator.assert_not_called()
+
+    def test_cpp_manual_analysis_finishes_without_constructing_translator(self):
+        asr_module = ModuleType('core.whisper_cpp_engine')
+        asr_module.WhisperCppEngine = Mock()
+        asr_module.WhisperCppEngine.return_value.extract_audio_text.return_value = [
+            dict(start=1, end=2, text='Hello', words=[]),
+        ]
+        translator_module = ModuleType('core.ollama_translator')
+        translator_module.OllamaTranslator = Mock(side_effect=AssertionError('Ollama called'))
+        namespace = dict(QThread=object, Signal=lambda *args: Mock(), List=list,
+                         os=__import__('os'), config_manager=SimpleNamespace(
+                             get=lambda key, default=None: "whisper_cpp" if key == "asr_engine" else default),
+                         get_video_info=lambda path: {'has_audio': True}, extract_audio=Mock(return_value=True),
+                         fuse_segments=fuse_segments, logger=logging.getLogger('manual_test'))
+        worker_cls = load_class('gui/workers.py', 'AnalyzeWorker', namespace)
+        worker = worker_cls('video.mp4', manual_translation=True)
+        with patch.dict('sys.modules', {'core.whisper_cpp_engine': asr_module,
                                        'core.ollama_translator': translator_module}):
             worker.run()
         worker.error.emit.assert_not_called()
@@ -109,7 +134,7 @@ class ManualTranslationTests(unittest.TestCase):
         namespace = dict(QThread=object, Signal=lambda *args: Mock(), List=list, Dict=dict,
                          math=__import__('math'), os=SimpleNamespace(path=SimpleNamespace(
                              join=__import__('os').path.join, exists=lambda path: True)),
-                         config_manager=SimpleNamespace(get=lambda key, default=None: default),
+                         config_manager=SimpleNamespace(get=lambda key, default=None: "faster_whisper" if key == "asr_engine" else default),
                          clear_segment_tts=load_source('media', {}).clear_segment_tts,
                          get_audio_duration=lambda path: 1.0, time_stretch_audio=Mock(return_value=True),
                          logger=logging.getLogger('manual_tts_test'))

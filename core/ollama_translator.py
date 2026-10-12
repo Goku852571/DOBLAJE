@@ -300,7 +300,6 @@ class OllamaTranslator:
             source = (
                 seg.get('source_text', '').strip() or
                 seg.get('asr_text', '').strip() or
-                seg.get('ocr_text', '').strip() or
                 seg.get('final_text', '').strip()
             )
             sources.append(source)

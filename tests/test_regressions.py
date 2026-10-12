@@ -12,18 +12,6 @@ from core.fusion import fuse_segments
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def ocr_class():
-    tree = ast.parse((ROOT / 'core/ocr_engine.py').read_text(encoding='utf-8'))
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
-    # Import neither EasyOCR nor Qt for pure geometry/timing tests.
-    namespace = dict(List=list, Dict=dict, Optional=__import__('typing').Optional,
-                     Callable=__import__('typing').Callable, Tuple=tuple,
-                     np=SimpleNamespace(ndarray=object, mean=lambda xs: sum(xs)/len(xs)),
-                     fuzz=SimpleNamespace(ratio=lambda a, b: 100 if a == b else 0))
-    exec(compile(ast.Module(body=[cls], type_ignores=[]), '<ocr>', 'exec'), namespace)
-    return namespace['OCREngine']
-
-
 def ollama_translator_class():
     tree = ast.parse((ROOT / 'core/ollama_translator.py').read_text(encoding='utf-8'))
     cls = next(
@@ -49,27 +37,20 @@ class RegressionTests(unittest.TestCase):
                 if not path.name.startswith('._'):
                     compile(path.read_text(encoding='utf-8'), str(path), 'exec')
 
-    def test_reading_order_tolerates_vertical_box_jitter(self):
-        def box(x, y, text):
-            return dict(bbox=[[x,y],[x+30,y],[x+30,y+20],[x,y+20]], text=text)
-        items = [box(80,10,'right'), box(10,13,'left'), box(10,50,'next')]
-        ordered = ocr_class()._reading_order(items)
-        self.assertEqual([i['text'] for i in ordered], ['left','right','next'])
+    def test_empty_transcription_has_no_segments(self):
+        self.assertEqual(fuse_segments([]), [])
 
-    def test_subtitle_gap_is_not_bridged(self):
-        engine = ocr_class()()
-        readings = [dict(time=t, text='你好', prob=0.9) for t in (0, .25, 1)]
-        result = engine._consolidate_results(readings, .25)
-        self.assertEqual([(s['start'],s['end']) for s in result], [(0,.5),(1,1.25)])
-
-    def test_consensus_preserves_observed_phrase(self):
-        readings = [dict(text='你好世界',prob=.8),dict(text='你好世界',prob=.9),
-                    dict(text='你好',prob=.95)]
-        self.assertEqual(ocr_class()._vote_words(readings), '你好世界')
-
-    def test_silent_video_keeps_ocr(self):
-        result = fuse_segments([dict(start=0,end=1,text='你好')], [])
-        self.assertEqual(result[0]['final_text'], '你好')
+    def test_audio_segments_preserve_text_and_timing(self):
+        words = [{"word": "Hola", "start": 1.2, "end": 1.8}]
+        result = fuse_segments([
+            dict(start=3, end=4, text="Adiós"),
+            dict(start=1, end=2, text="Hola", words=words, language="es"),
+        ])
+        self.assertEqual([s['start'] for s in result], [1, 3])
+        self.assertEqual(result[0]['source_text'], 'Hola')
+        self.assertEqual(result[0]['final_text'], 'Hola')
+        self.assertEqual(result[0]['words'], words)
+        self.assertEqual(result[0]['language'], 'es')
 
     def test_blank_translation_never_loads_model(self):
         engine = TranslationEngine()
@@ -122,9 +103,9 @@ class RegressionTests(unittest.TestCase):
         self.assertIn('"translated_script"', source)
         self.assertIn('"source_text"', source)
         self.assertIn('QApplication.clipboard().setText', source)
-        self.assertIn('def export_script_json', source)
         self.assertIn('QFileDialog.getOpenFileName', source)
-        self.assertIn('QFileDialog.getSaveFileName', source)
+        self.assertIn('QPlainTextEdit', source)
+        self.assertIn('text_edit.toPlainText()', source)
 
 
 if __name__ == '__main__':

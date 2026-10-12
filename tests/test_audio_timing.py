@@ -175,6 +175,83 @@ class AudioTimingTests(unittest.TestCase):
         self.assertLess(next(i for i, s in enumerate(data) if abs(s) > 100) / rate, 0.015)
         self.assertTrue(all(s == 0 for s in data[round(0.32 * rate):]))
 
+    def test_duration_matching_slows_speech_moderately_and_keeps_onset(self):
+        raw, fitted = self.folder / 'match_raw.wav', self.folder / 'match_fitted.wav'
+        write_wav(raw, [(0.2, 0), (0.82, 440), (0.2, 0)])
+        details = {}
+        self.assertTrue(self.media.time_stretch_audio(str(raw), 0.9, str(fitted),
+                                                    fit_info=details, match_duration=True))
+        rate, data = read_wav(fitted)
+        active = [i for i, sample in enumerate(data) if abs(sample) > 100]
+        self.assertGreaterEqual(details['tts_speed'], 0.85)
+        self.assertLess(details['tts_speed'], 1.0)
+        self.assertLess(active[0] / rate, 0.015)
+        self.assertGreater(active[-1] / rate, 0.85)
+        self.assertEqual(len(data), round(0.9 * rate))
+
+    def test_mix_preserves_stereo_background_channels(self):
+        import numpy as np
+        # Use distinct left/right frequencies to detect unwanted mono downmix.
+        original, voice, output = [self.folder / name for name in ('stereo.wav', 'voice.wav', 'stereo_mix.wav')]
+        left = array('h', (round(2000 * math.sin(2 * math.pi * 330 * i / RATE)) for i in range(2 * RATE)))
+        right = array('h', (round(2000 * math.sin(2 * math.pi * 660 * i / RATE)) for i in range(2 * RATE)))
+        stereo = array('h', (value for pair in zip(left, right) for value in pair))
+        with wave.open(str(original), 'wb') as wav:
+            wav.setnchannels(2)
+            wav.setsampwidth(2)
+            wav.setframerate(RATE)
+            wav.writeframes(stereo.tobytes())
+        write_wav(voice, [(0.1, 440)])
+        self.assertTrue(self.media.build_dubbed_audio(
+            [dict(start=1, end=1.1, tts_audio=str(voice))], str(original), 2,
+            str(output), str(self.folder), original_volume=1, preserve_stereo=True))
+        with wave.open(str(output), 'rb') as wav:
+            self.assertEqual(wav.getnchannels(), 2)
+            result = np.frombuffer(wav.readframes(RATE // 2), dtype='<i2').reshape(-1, 2)
+        # First half-second contains only background: its channels and gain survive.
+        self.assertLess(np.max(np.abs(result[:, 0].astype(float) - np.asarray(left[:RATE // 2]))), 5)
+        self.assertLess(np.max(np.abs(result[:, 1].astype(float) - np.asarray(right[:RATE // 2]))), 5)
+
+    def test_unintelligibly_fast_translation_is_rejected_without_chopping(self):
+        raw, output = self.folder / 'too_long.wav', self.folder / 'rejected.wav'
+        write_wav(raw, [(1.5, 440)])
+        with self.assertLogs('timing_tests', level='ERROR') as logs:
+            self.assertFalse(self.media.time_stretch_audio(str(raw), 0.3, str(output), max_speed=2.0))
+        self.assertFalse(output.exists())
+        self.assertIn('Acorte el texto', '\n'.join(logs.output))
+
+    def test_background_is_unchanged_even_when_loud_dubbing_requires_limiting(self):
+        import numpy as np
+        import soundfile as sf
+        bed, voice, output = [self.folder / name for name in ('loud_bed.wav', 'loud_dub.wav', 'preserved.wav')]
+        background = np.tile([.85, .30], (2 * RATE, 1))
+        dubbing = np.zeros((2 * RATE, 1))
+        dubbing[RATE // 2:3 * RATE // 2] = .8
+        sf.write(bed, background, RATE, subtype='FLOAT')
+        sf.write(voice, dubbing, RATE, subtype='FLOAT')
+        self.assertTrue(self.media._mix_preserving_background(
+            str(bed), str(voice), 2, str(output), str(self.folder), 1, 1, True))
+        mixed, rate = sf.read(output, always_2d=True)
+        self.assertEqual(rate, RATE)
+        self.assertEqual(mixed.shape, background.shape)
+        self.assertLessEqual(np.max(np.abs(mixed)), 1.000001)
+        # The channel difference isolates the bed: voice is identical in both.
+        # A global limiter would reduce this difference during the overlap.
+        np.testing.assert_allclose(mixed[:, 0] - mixed[:, 1], .55, atol=1e-6)
+        np.testing.assert_allclose(mixed[:RATE // 2], background[:RATE // 2], atol=1e-6)
+        self.assertGreater(mixed[RATE, 0], .99)
+
+    def test_background_preserving_mix_keeps_requested_voice_gain_without_auto_boost(self):
+        import numpy as np
+        import soundfile as sf
+        bed, voice, output = [self.folder / name for name in ('quiet_bed.wav', 'quiet_dub.wav', 'quiet_mix.wav')]
+        sf.write(bed, np.zeros(RATE), RATE, subtype='FLOAT')
+        sf.write(voice, np.full(RATE, .1), RATE, subtype='FLOAT')
+        self.assertTrue(self.media._mix_preserving_background(
+            str(bed), str(voice), 1, str(output), str(self.folder), 1, .5, False))
+        mixed, _ = sf.read(output)
+        np.testing.assert_allclose(mixed, .05, atol=1e-6)
+
     def test_mix_places_voices_at_absolute_times_even_if_original_is_shorter(self):
         raw, first, second = [self.folder / name for name in ("raw.wav", "first.wav", "second.wav")]
         write_wav(raw, [(0.22, 0), (0.5, 440), (0.18, 0)], rate=22050)

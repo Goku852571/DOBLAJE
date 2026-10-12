@@ -90,12 +90,13 @@ def get_video_info(video_path: str) -> Dict[str, Any]:
             logger.error(f"Error getting video info for {video_path}: {fallback_error}")
             return {"duration": 0.0, "fps": 0.0, "has_audio": False}
 
-def extract_audio(video_path: str, output_path: str) -> bool:
+def extract_audio(video_path: str, output_path: str, for_mixing: bool = False) -> bool:
     """Extract audio from video to a WAV file."""
+    rate = 48000 if for_mixing else 16000
     cmd = [
-        _ffmpeg_binary(), "-y", "-i", video_path,
-        "-map", "0:a:0", "-vn", "-af", "aresample=16000:async=1:first_pts=0",
-        "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        _ffmpeg_binary(), "-y", "-err_detect", "ignore_err", "-i", video_path,
+        "-map", "0:a:0", "-vn", "-async", "1",
+        "-acodec", "pcm_s16le", "-ar", str(rate), "-ac", "2" if for_mixing else "1",
         output_path
     ]
     try:
@@ -180,7 +181,8 @@ def _trim_pcm_silence(input_path: str, output_path: str) -> Dict:
 
 
 def time_stretch_audio(input_path: str, target_duration: float, output_path: str,
-                       log=None, fit_info=None) -> bool:
+                       log=None, fit_info=None, match_duration: bool = False,
+                       max_speed: float = None) -> bool:
     """Align the audible onset, accelerate if needed, then pad to exact length."""
     if not math.isfinite(target_duration) or target_duration <= 0:
         logger.error("Duración inválida para sincronizar voz.")
@@ -201,17 +203,23 @@ def time_stretch_audio(input_path: str, target_duration: float, output_path: str
                     capture_output=True, text=True, check=True)
             trimmed = _trim_pcm_silence(pcm, speech)
             speech_duration = trimmed["duration"]
-            speed = max(1.0, speech_duration / target_duration)
+            # Modest slowing aligns short phrases without stretching them unnaturally.
+            speed = max(0.85 if match_duration else 1.0, speech_duration / target_duration)
             # atempo does not always output the exact requested duration.
             # Measure and retry instead of chopping off the final spoken word.
-            for attempt in range(3):
+            for attempt in range(2):
+                if max_speed is not None and speed > max_speed:
+                    raise ValueError(f"La traducción requiere una velocidad de {speed:.2f}x. "
+                                     f"Acorte el texto para este intervalo; el máximo es {max_speed:.2f}x.")
                 run_cmd([_ffmpeg_binary(), "-y", "-i", speech,
                          "-af", ",".join(_atempo_chain(speed)), "-c:a", "pcm_s16le", tempo],
                         capture_output=True, text=True, check=True)
                 fitted_duration = _trim_pcm_silence(tempo, fitted)["duration"]
                 if fitted_duration <= target_duration:
                     break
-                speed *= fitted_duration / target_duration * 1.005
+                # Leave a small safety margin for atempo's analysis windows so
+                # the second and final attempt preserves the entire spoken tail.
+                speed *= fitted_duration / target_duration * 1.05
             else:
                 raise ValueError("No se pudo ajustar la voz completa al intervalo; regenere el segmento.")
             run_cmd([_ffmpeg_binary(), "-y", "-i", fitted, "-af",
@@ -225,7 +233,7 @@ def time_stretch_audio(input_path: str, target_duration: float, output_path: str
                                 tts_leading_silence=trimmed["leading_silence"],
                                 tts_trailing_silence=trimmed["trailing_silence"], tts_speed=speed)
             if log:
-                action = f"acelerando {speed:.2f}x" if speed > 1.0001 else "velocidad natural"
+                action = f"ajustando velocidad {speed:.2f}x" if not math.isclose(speed, 1.0, abs_tol=0.0001) else "velocidad natural"
                 log(f"Voz hablada: {speech_duration:.3f}s; intervalo: {target_duration:.3f}s; {action}. "
                     f"Silencio inicial eliminado: {trimmed['leading_silence']:.3f}s.")
         return True
@@ -234,13 +242,15 @@ def time_stretch_audio(input_path: str, target_duration: float, output_path: str
         return False
 
 def build_dubbed_audio(segments: List[Dict], original_audio: str, target_duration: float, output_path: str, temp_dir: str,
-                       original_volume: float = 0.5, tts_volume: float = 1.0) -> bool:
+                       original_volume: float = 0.5, tts_volume: float = 1.0,
+                       preserve_stereo: bool = False, preserve_background: bool = False) -> bool:
     """Mix original audio with TTS segments. Volumes are configurable (0.0 a 1.0+)."""
     if not math.isfinite(target_duration) or target_duration <= 0:
         logger.error("La duración del video no es válida para la mezcla.")
         return False
     rate = 48000
     total_samples = round(target_duration * rate)
+    layout = "stereo" if preserve_stereo else "mono"
     valid_segments = [s for s in segments if s.get('tts_audio') and os.path.isfile(s['tts_audio'])]
     logger.info("Segmentos TTS disponibles para mezcla: %d/%d", len(valid_segments), len(segments))
     if not valid_segments:
@@ -267,40 +277,70 @@ def build_dubbed_audio(segments: List[Dict], original_audio: str, target_duratio
     run_cmd(cmd_silence, capture_output=True, check=True)
     
     # 2. Mix all TTS clips onto the silent track using amix or adelay
-    # The command can get very long if we have many segments, so we use a complex filter
+    # 2. Batch mixing to avoid command line limits
+    batch_size = 40
+    batch_files = []
     
-    inputs = ["-i", silent_audio]
-    filter_complex = ""
-    
-    for i, seg in enumerate(valid_segments):
-        inputs.extend(["-i", seg['tts_audio']])
-        # Absolute sample positions avoid accumulated rounding or PTS offsets.
-        start_sample = round(float(seg['start']) * rate)
-        end_sample = round(float(seg['end']) * rate)
-        clip_samples = end_sample - start_sample
-        filter_complex += (
-            f"[{i+1}:a]aresample={rate},aformat=channel_layouts=mono,"
-            f"atrim=end_sample={clip_samples},asetpts=PTS-STARTPTS,"
-            f"adelay={start_sample}S:all=1[a{i}];"
-        )
-        
-    # Now mix all delayed audios with the silence
-    mix_inputs = "[0:a]" + "".join([f"[a{i}]" for i in range(len(valid_segments))])
-    if valid_segments:
-        filter_complex += (
-            f"{mix_inputs}amix=inputs={len(valid_segments)+1}:duration=first:"
+    for b_idx in range(0, len(valid_segments), batch_size):
+        batch = valid_segments[b_idx:b_idx+batch_size]
+        b_inputs = ["-i", silent_audio]
+        b_filter = ""
+        for i, seg in enumerate(batch):
+            b_inputs.extend(["-i", seg['tts_audio']])
+            # Absolute sample positions avoid accumulated rounding or PTS offsets.
+            start_sample = round(float(seg['start']) * rate)
+            end_sample = round(float(seg['end']) * rate)
+            clip_samples = end_sample - start_sample
+            b_filter += (
+                f"[{i+1}:a]aresample={rate},aformat=channel_layouts=mono,"
+                f"atrim=end_sample={clip_samples},asetpts=PTS-STARTPTS,"
+                f"adelay={start_sample}S:all=1[a{i}];"
+            )
+            
+        b_mix_inputs = "[0:a]" + "".join([f"[a{i}]" for i in range(len(batch))])
+        b_filter += (
+            f"{b_mix_inputs}amix=inputs={len(batch)+1}:duration=first:"
             "dropout_transition=0:normalize=0[tts_mix]"
         )
+        b_out = os.path.join(temp_dir, f"batch_{b_idx}.wav")
+        batch_files.append(b_out)
+        
+        cmd_b = [_ffmpeg_binary(), "-y"] + b_inputs + ["-filter_complex", b_filter, "-map", "[tts_mix]", b_out]
+        try:
+            run_cmd(cmd_b, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error mixing TTS batch {b_idx}: {e.stderr}")
+            return False
 
     tts_mixed_audio = os.path.join(temp_dir, "tts_mixed.wav")
-    
-    cmd_mix = [_ffmpeg_binary(), "-y"] + inputs + ["-filter_complex", filter_complex, "-map", "[tts_mix]", tts_mixed_audio]
-    try:
-        run_cmd(cmd_mix, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error mixing TTS: {e.stderr}")
+
+    # Mix the batches together
+    if not batch_files:
         return False
         
+    if len(batch_files) == 1:
+        import shutil
+        shutil.copyfile(batch_files[0], tts_mixed_audio)
+    else:
+        final_inputs = []
+        for f in batch_files:
+            final_inputs.extend(["-i", f])
+            
+        final_filter = "".join([f"[{i}:a]" for i in range(len(batch_files))])
+        final_filter += f"amix=inputs={len(batch_files)}:duration=first:dropout_transition=0:normalize=0[final_mix]"
+        
+        cmd_final = [_ffmpeg_binary(), "-y"] + final_inputs + ["-filter_complex", final_filter, "-map", "[final_mix]", tts_mixed_audio]
+        try:
+            run_cmd(cmd_final, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error final mixing TTS: {e.stderr}")
+            return False
+        
+    if preserve_background:
+        return _mix_preserving_background(original_audio, tts_mixed_audio, target_duration,
+                                          output_path, temp_dir, original_volume, tts_volume,
+                                          preserve_stereo)
+
     # 3. Mix original (volumen configurable) with TTS mixed (volumen configurable)
     cmd_final = [
         _ffmpeg_binary(), "-y",
@@ -308,13 +348,15 @@ def build_dubbed_audio(segments: List[Dict], original_audio: str, target_duratio
         "-i", tts_mixed_audio,
         "-filter_complex",
         (
-            f"[0:a]aresample={rate},asetpts=PTS-STARTPTS,apad=whole_len={total_samples},"
+            f"[0:a]aresample={rate},aformat=channel_layouts={layout},asetpts=PTS-STARTPTS,apad=whole_len={total_samples},"
             f"atrim=end_sample={total_samples},volume={original_volume}[org];"
-            f"[1:a]volume={tts_volume},dynaudnorm=f=150:g=15,asetpts=PTS-STARTPTS[tts];"
-            "[org][tts]amix=inputs=2:duration=first:dropout_transition=0:normalize=0"
+            f"[1:a]aformat=channel_layouts={layout},volume={tts_volume},dynaudnorm=f=150:g=15,asetpts=PTS-STARTPTS[tts];"
+            "[org][tts]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            "alimiter=limit=0.95:level=0:latency=1"
         ),
         "-acodec", "pcm_s16le" if output_path.lower().endswith(".wav") else "aac",
         "-ar", str(rate),
+        "-ac", "2" if preserve_stereo else "1",
         output_path
     ]
     
@@ -324,6 +366,63 @@ def build_dubbed_audio(segments: List[Dict], original_audio: str, target_duratio
     except subprocess.CalledProcessError as e:
         logger.error(f"Error final audio mix: {e.stderr}")
         return False
+
+def _mix_preserving_background(background, voice, duration, output_path, temp_dir,
+                               background_volume, voice_volume, stereo):
+    """Preserve the background component; clipping control affects dubbing only."""
+    import numpy as np
+    import soundfile as sf
+    rate, channels = 48000, 2 if stereo else 1
+    frames = round(duration * rate)
+    converted = os.path.join(temp_dir, "background_original_level.wav")
+    floating_mix = output_path if output_path.lower().endswith('.wav') else os.path.join(temp_dir, 'preserved_mix.wav')
+    try:
+        run_cmd([_ffmpeg_binary(), '-y', '-i', background, '-af',
+                 f'aresample={rate},apad=whole_len={frames},atrim=end_sample={frames}',
+                 '-ar', str(rate), '-ac', str(channels), '-c:a', 'pcm_f32le', converted],
+                capture_output=True, text=True, check=True)
+        gain_previous, limited_frames = 1.0, 0
+        release_step = 1 / (rate * .1)
+        with sf.SoundFile(converted) as bed, sf.SoundFile(voice) as speech, sf.SoundFile(
+                floating_mix, 'w', samplerate=rate, channels=channels, subtype='FLOAT') as mixed:
+            remaining = frames
+            while remaining:
+                count = min(rate, remaining)
+                bg = bed.read(count, dtype='float64', always_2d=True) * background_volume
+                dub = speech.read(count, dtype='float64', always_2d=True) * voice_volume
+                if len(bg) < count:
+                    bg = np.pad(bg, ((0, count - len(bg)), (0, 0)))
+                if len(dub) < count:
+                    dub = np.pad(dub, ((0, count - len(dub)), (0, 0)))
+                if dub.shape[1] != channels:
+                    dub = np.repeat(dub, channels, axis=1) if dub.shape[1] == 1 else dub.mean(axis=1, keepdims=True)
+                if not np.isfinite(bg).all() or not np.isfinite(dub).all():
+                    raise RuntimeError('La mezcla contiene muestras no válidas.')
+                if np.max(np.abs(bg)) > 1.0:
+                    logger.warning('El fondo separado tiene picos fuera del rango. Se limitarán (clipping) para evitar fallos.')
+                    bg = np.clip(bg, -1.0, 1.0)
+                allowance = np.ones_like(dub)
+                np.divide(1.0 - np.sign(dub) * bg, np.abs(dub), out=allowance, where=np.abs(dub) > 1e-12)
+                allowed = np.clip(allowance.min(axis=1), 0, 1)
+                # Immediate attack and 100 ms recovery affect only the added
+                # voice. No ducking or global normalization acts on the bed.
+                ticks = np.arange(1, count + 1) * release_step
+                gain = np.minimum.accumulate(np.minimum(allowed - ticks, gain_previous)) + ticks
+                gain = np.clip(gain, 0, 1)
+                gain_previous = float(gain[-1])
+                limited_frames += int(np.count_nonzero(gain < .9999))
+                mixed.write(bg + dub * gain[:, None])
+                remaining -= count
+        if floating_mix != output_path:
+            run_cmd([_ffmpeg_binary(), '-y', '-i', floating_mix, '-c:a', 'aac', output_path],
+                    capture_output=True, text=True, check=True)
+        logger.info('Fondo conservado a ganancia %.2f; control de picos solo en el doblaje durante %.3f s.',
+                    background_volume, limited_frames / rate)
+        return True
+    except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+        logger.error('Error conservando el volumen del fondo: %s', getattr(exc, 'stderr', None) or exc)
+        return False
+
 
 def render_final_video(video_path: str, new_audio_path: str, output_path: str) -> bool:
     """Combine original video (copy) with the new audio."""

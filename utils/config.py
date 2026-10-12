@@ -7,11 +7,14 @@ CONFIG_FILE = str(Path(__file__).resolve().parents[1] / "config.json")
 
 DEFAULT_CONFIG = {
  'tts_voice_name': 'Jorge',
- 'ocr_enabled': False,
- 'ocr_sample_rate': 0.25,
- 'ocr_confidence_threshold': 0.4,
- 'ocr_languages': ['ch_sim', 'en'],
- 'ocr_roi_bottom': 0.65,
+ 'tts_engine': 'sapi',
+ 'openspeaker_voice_id': '',
+ 'openspeaker_speed': 1.0,
+ 'asr_engine': 'whisper_cpp',
+ 'whisper_cpp_executable': 'tools/whisper_cpp/whisper-cli.exe',
+ 'whisper_cpp_model_path': 'models/whisper_cpp/ggml-large-v3-turbo.bin',
+ 'whisper_cpp_vad_path': 'tools/whisper_cpp/ggml-silero-v6.2.0.bin',
+ 'whisper_cpp_threads': 4,
  'asr_model': 'large-v3-turbo',
  'asr_model_path': 'models/models--mobiuslabsgmbh--faster-whisper-large-v3-turbo',
  'asr_device': 'cpu',
@@ -26,6 +29,8 @@ DEFAULT_CONFIG = {
  'translation_max_new_tokens': 512,
  'ollama_model': 'qwen2.5:7b',
  'original_audio_volume': 0.5,
+ 'remove_original_voice': False,
+ 'separation_model': 'UVR-MDX-NET-Inst_HQ_4',
  'tts_volume': 1.0}
 
 class ConfigManager:
