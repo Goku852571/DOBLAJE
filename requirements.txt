@@ -13,3 +13,6 @@ pywin32
 sherpa-onnx>=1.13.0
 sherpa-onnx-core>=1.13.0
 soundfile==0.13.1
+playwright>=1.40.0
+playwright-stealth>=2.0.0
+rich>=13.0.0

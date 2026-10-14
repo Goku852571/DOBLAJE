@@ -250,10 +250,22 @@ class WhisperCppEngine:
                        "--vad-model", str(self.vad_path), "--vad-threshold", "0.45",
                        "--vad-min-silence-duration-ms", "2000", "--vad-min-speech-duration-ms", "0"]
             tail, vad_mapping = [], []
-            with subprocess.Popen(command, cwd=str(self.executable.parent),
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, encoding="utf-8", errors="replace",
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as process:
+            try:
+                process = subprocess.Popen(command, cwd=str(self.executable.parent),
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           text=True, encoding="utf-8", errors="replace",
+                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except OSError as exc:
+                if getattr(exc, "winerror", None) in (4551, 577, 1260):
+                    raise RuntimeError(
+                        f"Windows bloqueó Whisper CPP mediante Control de aplicaciones: {self.executable}. "
+                        "El reconocimiento no llegó a iniciarse. Seleccione 'Faster Whisper (local)' "
+                        "en 'Motor de voz a texto' para utilizar el motor alternativo instalado. "
+                        "Para utilizar Whisper CPP, el administrador debe revisar "
+                        "Microsoft-Windows-CodeIntegrity/Operational y autorizar una distribución de confianza. "
+                        f"Detalle: {exc}") from exc
+                raise
+            with process:
                 for line in process.stdout:
                     entry = self.parse_vad_mapping(line)
                     if entry:

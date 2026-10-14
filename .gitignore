@@ -16,3 +16,7 @@ local_packages/
 config.json
 validation_*/
 tools/
+
+# Internal runtime data (downloads, session cookies and logs)
+data/
+logs/

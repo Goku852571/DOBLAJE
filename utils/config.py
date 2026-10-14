@@ -6,6 +6,10 @@ from typing import Any, Dict
 CONFIG_FILE = str(Path(__file__).resolve().parents[1] / "config.json")
 
 DEFAULT_CONFIG = {
+ 'tiktok_download_dir': 'data/descargas',
+ 'tiktok_profile_dir': 'data/perfil_chrome_tiktok',
+ 'tiktok_temp_dir': 'data/temp',
+ 'tiktok_browser': 'chrome',
  'tts_voice_name': 'Jorge',
  'tts_engine': 'sapi',
  'openspeaker_voice_id': '',
@@ -49,6 +53,8 @@ class ConfigManager:
             
             # Merge with default config to ensure all keys exist
             config = DEFAULT_CONFIG.copy()
+            for key in ("tiktok_project", "tiktok_python", "tiktok_output"):
+                loaded.pop(key, None)
             config.update(loaded)
             return config
         except Exception:

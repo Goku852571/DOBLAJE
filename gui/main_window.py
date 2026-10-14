@@ -3,6 +3,7 @@ import hashlib
 import os
 import tempfile
 from typing import List, Dict
+from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QLineEdit, QFileDialog, QTableWidget, QTableWidgetItem, 
@@ -10,7 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QApplication, QInputDialog, QCheckBox,
     QDialog, QPlainTextEdit, QDialogButtonBox
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from utils.logger import logger, logger_signals
 from utils.config import config_manager
 from core.media import clear_segment_tts
@@ -23,11 +24,17 @@ class MainWindow(QMainWindow):
         self.resize(1000, 700)
         
         self.video_path = ""
+        self._auto_dub_output = ""
+        self._pipeline_workers = []
         self.segments: List[Dict] = []
         self.temp_dir = tempfile.mkdtemp(prefix="videodub_")
         
         self.init_ui()
         self.init_logger()
+        self._analysis_save_timer = QTimer(self)
+        self._analysis_save_timer.setSingleShot(True)
+        self._analysis_save_timer.setInterval(1000)
+        self._analysis_save_timer.timeout.connect(self._auto_save_analysis)
 
     def init_ui(self):
         main_widget = QWidget()
@@ -45,6 +52,9 @@ class MainWindow(QMainWindow):
         btn_select_video.clicked.connect(self.select_video)
         video_layout.addWidget(self.lbl_video_path)
         video_layout.addWidget(btn_select_video)
+        self.btn_tiktok = QPushButton("Descargar videos de TikTok y doblar")
+        self.btn_tiktok.clicked.connect(self.download_tiktok)
+        video_layout.addWidget(self.btn_tiktok)
         
         # Config
         config_group = QGroupBox("Generación de voces")
@@ -133,6 +143,7 @@ class MainWindow(QMainWindow):
         self.btn_retry_translation.setEnabled(False)
         
         self.btn_tts = QPushButton("2. Generar Voces")
+        self.btn_tts.setToolTip("Conserva las voces válidas y reintenta los segmentos pendientes o modificados.")
         self.btn_tts.clicked.connect(self.start_tts)
         self.btn_tts.setEnabled(False)
         
@@ -157,6 +168,19 @@ class MainWindow(QMainWindow):
         json_layout.addWidget(self.btn_copy_script_json)
         json_layout.addWidget(self.btn_import_translation_json)
         layout.addLayout(json_layout)
+        analysis_controls = QHBoxLayout()
+        self.btn_save_analysis = QPushButton("Guardar análisis")
+        self.btn_load_analysis = QPushButton("Cargar análisis")
+        self.btn_save_analysis.setEnabled(False)
+        self.btn_load_analysis.setEnabled(False)
+        self.btn_save_analysis.clicked.connect(self.save_analysis_file)
+        self.btn_load_analysis.clicked.connect(self.load_analysis_file)
+        analysis_controls.addWidget(self.btn_save_analysis)
+        analysis_controls.addWidget(self.btn_load_analysis)
+        self.btn_load_tts_progress = QPushButton("Cargar progreso de voces")
+        self.btn_load_tts_progress.clicked.connect(self.load_tts_progress_file)
+        analysis_controls.addWidget(self.btn_load_tts_progress)
+        layout.addLayout(analysis_controls)
 
         # 3. Table
         self.table = QTableWidget(0, 4)
@@ -169,6 +193,8 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         layout.addWidget(self.progress_bar)
+        self.pipeline_status = QLabel("Preparado para seleccionar un video local o descargar TikTok")
+        layout.addWidget(self.pipeline_status)
         
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
@@ -179,6 +205,14 @@ class MainWindow(QMainWindow):
 
     def append_log(self, level: str, message: str):
         self.log_area.append(message)
+        lower = message.lower()
+        for fragment, stage in (("transcrip", "Análisis ASR"), ("idioma", "Detección de idioma"),
+                                ("traduc", "Traducción"), ("generando voz", "Generación de voces"),
+                                ("sincroniz", "Sincronización"), ("render", "Renderizado"),
+                                ("video final", "Renderizado")):
+            if fragment in lower:
+                self.pipeline_status.setText(stage)
+                break
         # Scroll to bottom
         scrollbar = self.log_area.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
@@ -203,19 +237,50 @@ class MainWindow(QMainWindow):
         config_manager.set("openspeaker_speed", self.api_speed.value())
         config_manager.set("tts_voice_name", self.txt_voice_name.text().strip() or "Jorge")
 
+    def download_tiktok(self):
+        if getattr(self, "worker", None) and self.worker.isRunning():
+            QMessageBox.information(self, "Proceso en curso", "Espera a que termine el proceso actual.")
+            return
+        from gui.tiktok_dialog import TikTokDialog
+        dialog = TikTokDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            result = dialog.result or {}
+            if result.get("success") and result.get("merged_video"):
+                self.load_video(result["merged_video"])
+                if result.get("auto_dub"):
+                    self._auto_dub_output = str(Path(self.video_path).parent / "Video_Doblado.mp4")
+                logger.info("MP4 TikTok validado listo para análisis: %s", self.video_path)
+                self.start_analysis()
+
+    def load_video(self, file_name):
+        if hasattr(self, 'btn_save_analysis'):
+            self._auto_save_analysis()
+        self._auto_dub_output = ""
+        self.video_path = file_name
+        self.lbl_video_path.setText(os.path.basename(file_name))
+        self.lbl_video_path.setToolTip(file_name)
+        self.btn_analyze.setEnabled(True)
+        self.table.setRowCount(0)
+        self.segments = []
+        self.btn_retry_translation.setEnabled(False)
+        self.btn_tts.setEnabled(False)
+        self.btn_render.setEnabled(False)
+        self.btn_copy_script_json.setEnabled(False)
+        self.btn_import_translation_json.setEnabled(False)
+
+        if hasattr(self, 'btn_save_analysis'):
+            self.btn_save_analysis.setEnabled(False)
+            self.btn_load_analysis.setEnabled(True)
+            from core.analysis_store import cache_path
+            if cache_path(file_name).is_file():
+                self.pipeline_status.setText("Hay un análisis guardado: pulse Cargar análisis o Analizar audio para reutilizarlo.")
+
     def select_video(self):
+        if self._analysis_busy():
+            return
         file_name, _ = QFileDialog.getOpenFileName(self, "Seleccionar Video", "", "Video Files (*.mp4 *.mkv *.avi *.mov)")
         if file_name:
-            self.video_path = file_name
-            self.lbl_video_path.setText(os.path.basename(file_name))
-            self.btn_analyze.setEnabled(True)
-            self.table.setRowCount(0)
-            self.segments = []
-            self.btn_retry_translation.setEnabled(False)
-            self.btn_tts.setEnabled(False)
-            self.btn_render.setEnabled(False)
-            self.btn_copy_script_json.setEnabled(False)
-            self.btn_import_translation_json.setEnabled(False)
+            self.load_video(file_name)
 
     def test_ollama_connection(self):
         """Prueba la conexión con Ollama antes de iniciar el análisis."""
@@ -253,6 +318,8 @@ class MainWindow(QMainWindow):
         if not self.video_path:
             return
         
+        if hasattr(self, 'btn_load_analysis') and self._offer_saved_analysis():
+            return
         self.save_recognition_config()
         manual = config_manager.get("translation_mode", "automatic") == "manual"
         self.btn_analyze.setEnabled(False)
@@ -274,6 +341,8 @@ class MainWindow(QMainWindow):
         
         self.save_recognition_config()
         self.segments = []
+        if getattr(self, "worker", None):
+            self._pipeline_workers.append(self.worker)
         self.worker = AnalyzeWorker(self.video_path, manual_translation=manual)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log.connect(lambda msg: logger.info(msg))
@@ -314,7 +383,8 @@ class MainWindow(QMainWindow):
         self.worker = RetryTranslationWorker(
             self.segments,
             host=config_manager.get("ollama_host", "http://localhost:11434"),
-            target_language=config_manager.get("translation_target", "español")
+            target_language=config_manager.get("translation_target", "español"),
+            video_path=self.video_path
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log.connect(lambda msg: logger.info(msg))
@@ -324,6 +394,8 @@ class MainWindow(QMainWindow):
 
     def on_retry_translation_finished(self, segments: List[Dict]):
         self.segments = segments
+        if hasattr(self, 'btn_save_analysis'):
+            self._auto_save_analysis()
         self.populate_table()
         self.btn_analyze.setEnabled(True)
         self.btn_retry_translation.setEnabled(True)
@@ -337,6 +409,8 @@ class MainWindow(QMainWindow):
 
     def on_analysis_finished(self, segments: List[Dict]):
         self.segments = sorted(segments, key=lambda s: (s['start'], s['end']))
+        if hasattr(self, 'btn_save_analysis'):
+            self._auto_save_analysis()
         self.populate_table()
         self.btn_analyze.setEnabled(True)
         if segments:
@@ -353,6 +427,12 @@ class MainWindow(QMainWindow):
             self.btn_import_translation_json.setEnabled(True)
             # Contar cuántos segmentos tienen traducción
             translated_count = sum(1 for s in segments if s.get('final_text', '').strip())
+            if getattr(self, "_auto_dub_output", ""):
+                if translated_count == len(segments):
+                    QTimer.singleShot(0, self.start_tts)
+                else:
+                    self.on_worker_error("Faltan traducciones. El doblaje automático se detuvo.")
+                return
             QMessageBox.information(
                 self, "Análisis Completado",
                 f"Análisis finalizado: {len(segments)} segmentos.\n"
@@ -360,6 +440,7 @@ class MainWindow(QMainWindow):
                 f"Revise la columna 'Texto Final' y use 'Reintentar Traducción' si es necesario."
             )
         else:
+            self._auto_dub_output = ""
             QMessageBox.warning(self, "Advertencia", "No se encontraron segmentos para traducir.")
 
     def populate_table(self):
@@ -377,6 +458,8 @@ class MainWindow(QMainWindow):
             item_asr.setFlags(item_asr.flags() & ~Qt.ItemIsEditable)
             
             item_final = QTableWidgetItem(seg.get('final_text', ''))
+            if seg.get('tts_error'):
+                item_final.setToolTip('Voz pendiente: ' + seg['tts_error'])
             
             self.table.setItem(i, 0, item_start)
             self.table.setItem(i, 1, item_end)
@@ -385,6 +468,8 @@ class MainWindow(QMainWindow):
             
         self.table.blockSignals(False)
         has_segments = bool(self.segments)
+        if hasattr(self, 'btn_save_analysis'):
+            self.btn_save_analysis.setEnabled(has_segments)
         self.btn_copy_script_json.setEnabled(has_segments)
         self.btn_import_translation_json.setEnabled(has_segments)
 
@@ -395,6 +480,7 @@ class MainWindow(QMainWindow):
                 self.segments[row]['final_text'] = item.text()
                 clear_segment_tts(self.segments[row])
                 self.btn_render.setEnabled(False)
+                self._queue_analysis_save()
 
     def _segment_source_text(self, seg: Dict) -> str:
         return (
@@ -428,6 +514,10 @@ class MainWindow(QMainWindow):
                 "Traduce y adapta source_script al español latino neutro para doblaje profesional. "
                 "Usa el contexto completo del guion, conserva intención y continuidad, y escribe frases "
                 "naturales para voz hablada. Respeta cada id. Mantén las frases breves según duration. "
+                "Analiza y utiliza nombres latinos en lugar de nombres chinos, manteniendo la consistencia "
+                "a lo largo de todo el guion (por ejemplo, personajes de la misma familia deben mantener coherencia "
+                "y compartir apellido). Realiza la conversión monetaria correspondiente: cuando hablen de yuanes, "
+                "haz la conversión correspondiente a dólares. "
                 "Devuelve solo JSON válido con la clave translated_script."
             ),
             "source_script": source_script,
@@ -488,7 +578,11 @@ class MainWindow(QMainWindow):
             self.btn_tts.setEnabled(True)
             self.btn_render.setEnabled(False)
             self.btn_retry_translation.setEnabled(False)
+        self._queue_analysis_save()
         logger.info("Traducciones importadas desde JSON: %d segmentos.", applied)
+        if getattr(self, "_auto_dub_output", "") and applied == len(self.segments):
+            QTimer.singleShot(0, self.start_tts)
+            return
         QMessageBox.information(
             self,
             "Traducción Importada",
@@ -550,10 +644,12 @@ class MainWindow(QMainWindow):
         return applied
 
     def start_tts(self):
+        if hasattr(self, 'btn_save_analysis'):
+            self._auto_save_analysis()
         if not self.segments:
             return
-        if config_manager.get("translation_mode", "automatic") == "manual" and any(not s.get('final_text', '').strip() for s in self.segments):
-            QMessageBox.warning(self, "Traducción pendiente", "Importe el JSON con todos los segmentos traducidos antes de generar las voces.")
+        if any(not s.get('final_text', '').strip() for s in self.segments):
+            QMessageBox.warning(self, "Traducción pendiente", "Complete las traducciones pendientes con Reintentar Traducción o importe el JSON antes de generar las voces.")
             return
 
         self.btn_analyze.setEnabled(False)
@@ -564,6 +660,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         
         self.save_tts_config()
+        if getattr(self, "worker", None):
+            self._pipeline_workers.append(self.worker)
         self.worker = TTSWorker(self.segments, self.temp_dir, api_key=self.api_key.text().strip())
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log.connect(lambda msg: logger.info(msg))
@@ -573,16 +671,24 @@ class MainWindow(QMainWindow):
 
     def on_tts_finished(self, segments: List[Dict]):
         self.segments = segments
+        if hasattr(self, 'btn_save_analysis'):
+            self.populate_table()
+            self._auto_save_analysis()
         self.btn_analyze.setEnabled(True)
         self.btn_retry_translation.setEnabled(self._can_auto_translate())
         self.btn_import_translation_json.setEnabled(True)
         self.btn_tts.setEnabled(True)
         self.btn_render.setEnabled(True)
+        if getattr(self, "_auto_dub_output", ""):
+            QTimer.singleShot(0, self.start_render)
+            return
         QMessageBox.information(self, "Voces Generadas", "Voces generadas correctamente. Puede crear el video final.")
 
     def start_render(self):
         self.save_recognition_config()
-        output_path, _ = QFileDialog.getSaveFileName(self, "Guardar Video Final", "", "MP4 Video (*.mp4)")
+        output_path = getattr(self, "_auto_dub_output", "")
+        if not output_path:
+            output_path, _ = QFileDialog.getSaveFileName(self, "Guardar Video Final", "", "MP4 Video (*.mp4)")
         if not output_path:
             return
 
@@ -593,6 +699,8 @@ class MainWindow(QMainWindow):
         self.btn_import_translation_json.setEnabled(False)
         self.progress_bar.setValue(0)
         
+        if getattr(self, "worker", None):
+            self._pipeline_workers.append(self.worker)
         self.worker = RenderWorker(self.video_path, self.segments, self.temp_dir, output_path)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log.connect(lambda msg: logger.info(msg))
@@ -601,6 +709,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def on_render_finished(self, output_path: str):
+        self._auto_dub_output = ""
         self.btn_analyze.setEnabled(True)
         self.btn_retry_translation.setEnabled(self._can_auto_translate())
         self.btn_import_translation_json.setEnabled(bool(self.segments))
@@ -609,6 +718,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Video Creado", f"Video final guardado en:\n{output_path}")
 
     def on_worker_error(self, error_msg: str):
+        self._auto_dub_output = ""
         self.btn_analyze.setEnabled(True)
         self.btn_retry_translation.setEnabled(self._can_auto_translate())
         self.btn_import_translation_json.setEnabled(bool(self.segments))
@@ -622,6 +732,8 @@ class MainWindow(QMainWindow):
             self.btn_tts.setEnabled(False)
             self.btn_render.setEnabled(False)
                 
+        if getattr(getattr(self, "worker", None), "tts_engine", None):
+            self.populate_table()
         QMessageBox.critical(self, "Error", error_msg)
         logger.error(error_msg)
 
@@ -629,3 +741,117 @@ class MainWindow(QMainWindow):
         return bool(self.segments) and config_manager.get("translation_mode", "automatic") != "manual" and not any(
             s.get("translation_source") == "manual_json" for s in self.segments
         )
+
+    def _queue_analysis_save(self):
+        timer = getattr(self, '_analysis_save_timer', None)
+        if timer is not None:
+            timer.start()
+
+    def _auto_save_analysis(self):
+        if not self.video_path or not self.segments:
+            return
+        try:
+            from core.analysis_store import save_analysis
+            path = save_analysis(self.video_path, self.segments)
+            logger.info("Análisis y traducciones guardados: %s", path)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error("No se pudo guardar el análisis: %s", exc)
+
+    def _analysis_busy(self):
+        worker = getattr(self, 'worker', None)
+        if worker is not None and worker.isRunning():
+            QMessageBox.information(self, "Proceso en curso", "Espere a que termine el proceso antes de cambiar el video o el análisis.")
+            return True
+        return False
+
+    def save_analysis_file(self):
+        if not self.video_path or not self.segments or self._analysis_busy():
+            return
+        suggested = str(Path(self.video_path).with_suffix('.analisis.json'))
+        filename, _ = QFileDialog.getSaveFileName(self, "Guardar análisis ASR y traducciones", suggested, "Análisis JSON (*.json)")
+        if not filename:
+            return
+        try:
+            from core.analysis_store import save_analysis
+            save_analysis(self.video_path, self.segments, filename)
+            self.pipeline_status.setText("Análisis exportado: " + filename)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.critical(self, "No se pudo guardar el análisis", str(exc))
+
+    def _apply_saved_analysis(self, segments):
+        self.segments = segments
+        self.populate_table()
+        complete = bool(segments) and all(s.get('final_text', '').strip() for s in segments)
+        self.btn_analyze.setEnabled(True)
+        self.btn_tts.setEnabled(complete)
+        self.btn_render.setEnabled(False)
+        self.btn_retry_translation.setEnabled(self._can_auto_translate())
+        self.progress_bar.setValue(100)
+        self.pipeline_status.setText(f"Análisis recuperado: {len(segments)} segmentos. No se ejecutó ASR.")
+        logger.info("Análisis recuperado sin ASR: %d segmentos.", len(segments))
+        if getattr(self, '_auto_dub_output', '') and complete:
+            QTimer.singleShot(0, self.start_tts)
+
+    def load_analysis_file(self):
+        if not self.video_path or self._analysis_busy():
+            return
+        from core.analysis_store import cache_path, load_analysis
+        cached = cache_path(self.video_path)
+        filename, _ = QFileDialog.getOpenFileName(self, "Cargar análisis del video seleccionado", str(cached if cached.is_file() else Path(self.video_path).parent), "Análisis JSON (*.json)")
+        if not filename:
+            return
+        try:
+            segments = load_analysis(self.video_path, filename)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.critical(self, "No se pudo cargar el análisis", str(exc))
+            return
+        self._apply_saved_analysis(segments)
+        self._auto_save_analysis()
+
+    def _offer_saved_analysis(self):
+        from core.analysis_store import cache_path, load_analysis
+        if not cache_path(self.video_path).is_file():
+            return False
+        try:
+            segments = load_analysis(self.video_path)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("El análisis guardado no se puede reutilizar: %s", exc)
+            return False
+        answer = QMessageBox.question(self, "Análisis disponible",
+            "Este video ya tiene un análisis guardado. ¿Desea reutilizarlo?\n"
+            "Sí: cargar sin ejecutar ASR. No: analizar nuevamente. Cancelar: volver.",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
+        if answer == QMessageBox.Cancel:
+            return True
+        if answer == QMessageBox.Yes:
+            self._apply_saved_analysis(segments)
+            return True
+        return False
+
+    def closeEvent(self, event):
+        self._auto_save_analysis()
+        super().closeEvent(event)
+
+    def load_tts_progress_file(self):
+        if self._analysis_busy():
+            return
+        if not self.segments:
+            QMessageBox.information(self, "Cargue el análisis", "Seleccione el video y cargue su análisis ASR antes de recuperar las voces.")
+            return
+        filename, _ = QFileDialog.getOpenFileName(self, "Cargar tts_progreso.json", "", "Progreso JSON (*.json)")
+        if not filename:
+            return
+        try:
+            from core.tts_recovery import load_tts_progress
+            segments, valid = load_tts_progress(self.segments, filename)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            QMessageBox.critical(self, "No se pudo recuperar el progreso", str(exc))
+            return
+        self.segments = segments
+        self.populate_table()
+        complete = all(s.get('final_text', '').strip() for s in segments)
+        required = sum(bool(s.get('final_text', '').strip()) for s in segments)
+        self.btn_tts.setEnabled(complete)
+        self.btn_render.setEnabled(complete and valid == required)
+        self._auto_save_analysis()
+        self.pipeline_status.setText(f"Voces recuperadas: {valid}/{required}. Genere solo las pendientes.")

@@ -42,10 +42,11 @@ class RetryTranslationWorker(QThread):
     finished = Signal(list)  # Updated segments
     error = Signal(str)
 
-    def __init__(self, segments: List[Dict], host: str, target_language: str):
+    def __init__(self, segments: List[Dict], host: str, target_language: str, video_path: str = ""):
         super().__init__()
         self.segments = segments
         self.host = host
+        self.video_path = video_path
         self.target_language = target_language
 
     def run(self):
@@ -77,7 +78,18 @@ class RetryTranslationWorker(QThread):
             self.log.emit(
                 "Analizando el guion completo para mejorar contexto antes de traducir..."
             )
-            translations = translator.translate_segments_contextual(self.segments)
+            def on_batch(done, count, values):
+                for segment, translated in zip(self.segments, values):
+                    segment['final_text'] = translated
+                self.progress.emit(int(done / count * 100))
+                self.log.emit(f"Traducción contextual completada: {done}/{count} segmentos.")
+                if self.video_path:
+                    try:
+                        from core.analysis_store import save_analysis
+                        save_analysis(self.video_path, self.segments)
+                    except (OSError, ValueError, TypeError) as exc:
+                        self.log.emit(f"No se pudo guardar el progreso de traducción: {exc}")
+            translations = translator.translate_segments_contextual(self.segments, progress_callback=on_batch)
             for i, (seg, source, translated) in enumerate(zip(self.segments, sources, translations)):
                 if source and translated:
                     seg['source_text'] = source
@@ -88,7 +100,6 @@ class RetryTranslationWorker(QThread):
                     self.log.emit(f"  [{i+1}/{total}] ERROR: no se obtuvo traducción al español.")
                 else:
                     self.log.emit(f"  [{i+1}/{total}] Sin texto original, saltando.")
-                self.progress.emit(int((i + 1) / total * 100))
             
             self.log.emit(f"Traducción completada: {total} segmentos procesados.")
             self.finished.emit(self.segments)
@@ -151,6 +162,16 @@ class AnalyzeWorker(QThread):
                 else:
                     raise RuntimeError("El video no tiene una pista de audio para transcribir.")
                 segments = fuse_segments(asr_results)
+                if segments:
+                    try:
+                        from core.analysis_store import save_analysis
+                        # Todavía no hay traducción: no confundir el original con español.
+                        for segment in segments:
+                            segment['final_text'] = ''
+                        saved = save_analysis(self.video_path, segments)
+                        self.log.emit(f"Análisis ASR guardado antes de traducir: {saved}")
+                    except (OSError, ValueError, TypeError) as exc:
+                        self.log.emit(f"No se pudo guardar el análisis ASR: {exc}")
                 if self.manual_translation:
                     for seg in segments:
                         seg['source_text'] = seg.get('source_text') or seg.get('asr_text', '')
@@ -186,7 +207,17 @@ class AnalyzeWorker(QThread):
                         sources.append(source)
                         seg['source_text'] = source
 
-                    translations = translator.translate_segments_contextual(segments)
+                    def on_batch(done, count, values):
+                        for segment, translated in zip(segments, values):
+                            segment['final_text'] = translated
+                        self.progress.emit(80 + int(done / count * 20))
+                        self.log.emit(f"Traducción contextual completada: {done}/{count} segmentos.")
+                        try:
+                            from core.analysis_store import save_analysis
+                            save_analysis(self.video_path, segments)
+                        except (OSError, ValueError, TypeError) as exc:
+                            self.log.emit(f"No se pudo guardar el progreso de traducción: {exc}")
+                    translations = translator.translate_segments_contextual(segments, progress_callback=on_batch)
                     for i, (seg, source, translated) in enumerate(zip(segments, sources, translations)):
                         if source and translated:
                             seg['final_text'] = translated
@@ -197,7 +228,6 @@ class AnalyzeWorker(QThread):
                             self.log.emit(f"  [{i+1}] ERROR: no se obtuvo traducción al español.")
                         else:
                             self.log.emit(f"  [{i+1}] Sin texto original, saltando.")
-                        self.progress.emit(80 + int((i + 1) / len(segments) * 20))
                 self.progress.emit(100)
                 self.log.emit(f"Análisis completado: {len(segments)} segmentos traducidos.")
                 self.finished.emit(segments)
@@ -225,7 +255,110 @@ class TTSWorker(QThread):
         self.api_voice = config_manager.get("openspeaker_voice_id", "")
         self.api_speed = config_manager.get("openspeaker_speed", 1.0)
 
+    def _valid_audio(self, path, expected=None):
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            duration = get_audio_duration(path)
+            return (math.isfinite(duration) and duration > 0 and
+                    (expected is None or abs(duration - expected) <= 2 / 48000))
+        except Exception:
+            return False
+
+    def _save_checkpoint(self):
+        import json
+        import os as filesystem
+        if not filesystem.path.isdir(self.temp_dir):
+            return
+        destination = filesystem.path.join(self.temp_dir, "tts_progreso.json")
+        try:
+            with open(destination + ".tmp", "w", encoding="utf-8") as handle:
+                json.dump({"segments": self.segments}, handle, ensure_ascii=False, indent=2)
+            filesystem.replace(destination + ".tmp", destination)
+        except (OSError, TypeError, ValueError) as exc:
+            self.log.emit(f"No se pudo guardar el progreso TTS: {exc}")
+
+    def _repair_segment_text(self, seg, previous):
+        source = (seg.get('source_text') or seg.get('asr_text') or '').strip()
+        if not source:
+            return None
+        from core.ollama_translator import OllamaTranslator
+        translator = OllamaTranslator(host=config_manager.get('ollama_host', 'http://localhost:11434'))
+        try:
+            if not translator.is_available():
+                self.log.emit("Ollama no está disponible para reparar la frase; se conserva el texto anterior.")
+                return None
+            candidate = translator.repair_for_dubbing(source, seg['end']-seg['start'], previous)
+            return candidate if candidate != previous else None
+        except Exception as exc:
+            self.log.emit(f"No se pudo reparar automáticamente la frase: {exc}")
+            return None
+        finally:
+            translator.close()
+
+    def _generate_segment(self, provider, i, seg, text, signature):
+        import uuid
+        original_start, original_end = seg['start'], seg['end']
+        target_dur = (round(original_end * 48000) - round(original_start * 48000)) / 48000
+        raw_audio = seg.get('tts_raw_audio')
+        if not (seg.get('tts_raw_text') == text and seg.get('tts_signature') == signature
+                and self._valid_audio(raw_audio)):
+            raw_audio = os.path.join(self.temp_dir, f"tts_raw_{i}_{uuid.uuid4().hex}.wav")
+            messages = []
+            def report(message):
+                messages.append(str(message))
+                self.log.emit(f"  Segmento {i+1}: {message}")
+            success = provider.synthesize(text=text, output_path=raw_audio, voice_id=self.voice_name,
+                                          target_duration=target_dur, log=report)
+            if not success or not self._valid_audio(raw_audio):
+                raise RuntimeError(messages[-1] if messages else "La síntesis devolvió audio ausente, vacío o inválido.")
+            seg.update(tts_raw_audio=raw_audio, tts_raw_text=text, tts_signature=signature)
+        else:
+            self.log.emit(f"  Segmento {i+1}: reutilizando síntesis válida para ajustar la sincronización.")
+        raw_duration = get_audio_duration(raw_audio)
+        start, end = original_start, original_end
+        if raw_duration > target_dur:
+            extra = raw_duration - target_dur
+            prev_end = self.segments[i-1]['end'] if i > 0 else 0.0
+            # No extender el último segmento fuera de la duración conocida.
+            next_start = self.segments[i+1]['start'] if i+1 < len(self.segments) else end
+            before = max(0.0, start - prev_end - .1)
+            after = max(0.0, next_start - end - .1)
+            expand_before, expand_after = min(before, extra/2), min(after, extra/2)
+            remaining = extra - expand_before - expand_after
+            add_before = min(before - expand_before, remaining)
+            expand_before += add_before
+            expand_after += min(after - expand_after, remaining - add_before)
+            start, end = start - expand_before, end + expand_after
+            target_dur = (round(end * 48000) - round(start * 48000)) / 48000
+            if expand_before or expand_after:
+                self.log.emit(f"  Segmento {i+1}: aprovechando silencios (-{expand_before:.2f}s, +{expand_after:.2f}s).")
+        fit_info = {}
+        stretched_audio = os.path.join(self.temp_dir, f"tts_stretch_{i}_{uuid.uuid4().hex}.wav")
+        self.log.emit(f"Ajustando segmento {i+1}: voz {raw_duration:.2f}s para intervalo {target_dur:.2f}s...")
+        success = time_stretch_audio(raw_audio, target_dur, stretched_audio,
+            log=lambda message: self.log.emit(f"  Segmento {i+1}: {message}"),
+            fit_info=fit_info, match_duration=True, max_speed=2.0)
+        if not success:
+            detail = fit_info.get('error', 'Falló la sincronización de audio.')
+            if fit_info.get('retryable') is False:
+                raise ValueError(detail + " Revise o acorte el texto del segmento; no se recortará la voz.")
+            raise RuntimeError(detail)
+        if not self._valid_audio(stretched_audio, target_dur):
+            raise RuntimeError("El audio sincronizado está vacío o su duración no coincide con el intervalo.")
+        seg.update(fit_info)
+        seg.update(start=start, end=end, tts_audio=stretched_audio, tts_raw_duration=raw_duration,
+                   tts_target_duration=target_dur, tts_start=start, tts_end=end, tts_text=text,
+                   tts_signature=signature)
+        if seg.get('final_text') != text:
+            seg['tts_previous_text'] = seg.get('final_text', '')
+            seg['final_text'] = text
+            seg['translation_source'] = 'reparacion_doblaje'
+        seg.pop('tts_error', None)
+        self.log.emit(f"  Segmento {i+1} sincronizado: {start:.3f}s a {end:.3f}s.")
+
     def run(self):
+        import time
         try:
             from core.tts_provider import SapiTTSProvider
             if self.tts_engine == "openspeaker":
@@ -234,104 +367,89 @@ class TTSWorker(QThread):
                 self.voice_name = self.api_voice
             else:
                 provider = SapiTTSProvider(voice_name=self.voice_name)
-            total = len(self.segments)
-            failures = []
-            
+            signature = [self.tts_engine, self.voice_name, self.api_speed if self.tts_engine == 'openspeaker' else None]
+            total, failures, reused = len(self.segments), [], 0
+            consecutive_failures = 0
+            checkpoint_dirty = False
             for i, seg in enumerate(self.segments):
-                clear_segment_tts(seg)
-                text = seg.get("final_text", "").strip()
+                text = seg.get('final_text', '').strip()
                 if not text:
-                    self.log.emit(f"Segmento {i+1} vacío, saltando.")
+                    clear_segment_tts(seg)
+                    self.progress.emit(int((i+1) / total * 100))
                     continue
-                    
-                target_dur = (round(seg['end'] * 48000) - round(seg['start'] * 48000)) / 48000
-                if not math.isfinite(target_dur) or target_dur <= 0 or seg['start'] < 0:
-                    self.log.emit(f"Segmento {i+1} con duración inválida, saltando.")
-                    failures.append(i + 1)
-                    continue
-
-                self.log.emit(f"Generando voz para segmento {i+1}/{total}...")
-                
-                raw_audio = os.path.join(self.temp_dir, f"tts_raw_{i}.wav")
-                stretched_audio = os.path.join(self.temp_dir, f"tts_stretch_{i}.wav")
-                
-                success = provider.synthesize(
-                    text=text,
-                    output_path=raw_audio,
-                    voice_id=self.voice_name,
-                    target_duration=target_dur,
-                    log=lambda msg: self.log.emit(msg)
-                )
-                
-                if success and os.path.exists(raw_audio):
-                    raw_duration = get_audio_duration(raw_audio)
-                    
-                    if raw_duration > target_dur:
-                        extra_needed = raw_duration - target_dur
-                        prev_end = self.segments[i-1]['end'] if i > 0 else 0.0
-                        next_start = self.segments[i+1]['start'] if i + 1 < len(self.segments) else float('inf')
-                        
-                        margin = 0.1
-                        max_expand_before = max(0.0, seg['start'] - prev_end - margin)
-                        max_expand_after = max(0.0, next_start - seg['end'] - margin)
-                        
-                        expand_before = min(max_expand_before, extra_needed / 2.0)
-                        expand_after = min(max_expand_after, extra_needed / 2.0)
-                        
-                        rem = extra_needed - (expand_before + expand_after)
-                        if rem > 0:
-                            add_before = min(max_expand_before - expand_before, rem)
-                            expand_before += add_before
-                            rem -= add_before
-                        if rem > 0:
-                            add_after = min(max_expand_after - expand_after, rem)
-                            expand_after += add_after
-                            
-                        if expand_before > 0 or expand_after > 0:
-                            seg['start'] = max(0.0, seg['start'] - expand_before)
-                            seg['end'] += expand_after
-                            target_dur = (round(seg['end'] * 48000) - round(seg['start'] * 48000)) / 48000
-                            self.log.emit(f"  Expansión inteligente: aprovecha silencios (-{expand_before:.2f}s inicio, +{expand_after:.2f}s fin).")
-                    
-                    self.log.emit(
-                        f"Ajustando segmento {i+1}: voz {raw_duration:.2f}s "
-                        f"para intervalo {target_dur:.2f}s..."
-                    )
-                    fit_info = {}
-                    if time_stretch_audio(
-                        raw_audio, target_dur, stretched_audio,
-                        log=lambda message: self.log.emit(f"  {message}"),
-                        fit_info=fit_info,
-                        match_duration=True,
-                        max_speed=2.0,
-                    ):
-                        seg['tts_audio'] = stretched_audio
-                        seg['tts_raw_duration'] = raw_duration
-                        seg['tts_target_duration'] = target_dur
-                        seg.update(fit_info)
-                        seg['tts_start'] = seg['start']
-                        seg['tts_end'] = seg['end']
-                        seg['tts_text'] = text
-                        self.log.emit(f"  Segmento {i+1} sincronizado: {seg['start']:.3f}s a {seg['end']:.3f}s.")
+                try:
+                    start, end = float(seg['start']), float(seg['end'])
+                    if not all(math.isfinite(t) for t in (start, end)) or not 0 <= start < end:
+                        raise ValueError("Intervalo inválido; corrija los tiempos antes de reintentar.")
+                    target = (round(end*48000) - round(start*48000)) / 48000
+                    if (seg.get('tts_signature') == signature and seg.get('tts_text') == text and
+                            seg.get('tts_start') == start and seg.get('tts_end') == end and
+                            self._valid_audio(seg.get('tts_audio'), target)):
+                        consecutive_failures = 0
+                        reused += 1
+                        self.log.emit(f"Segmento {i+1}/{total}: voz válida conservada.")
                     else:
-                        self.log.emit(f"Error sincronizando el segmento {i+1}; no se mezclará.")
-                        failures.append(i + 1)
-                else:
-                    self.log.emit(f"Fallo síntesis de voz para segmento {i+1}.")
-                    failures.append(i + 1)
-
-                self.progress.emit(int(((i+1) / total) * 100))
-
+                        # Conservar la síntesis original si todavía coincide con texto y voz.
+                        raw_cache = {key: seg[key] for key in ('tts_raw_audio', 'tts_raw_text', 'tts_signature') if key in seg}
+                        clear_segment_tts(seg)
+                        seg.update(raw_cache)
+                        for attempt in range(1, 4):
+                            try:
+                                self.log.emit(f"Generando voz para segmento {i+1}/{total}, intento {attempt}/3...")
+                                self._generate_segment(provider, i, seg, text, signature)
+                                checkpoint_dirty = True
+                                consecutive_failures = 0
+                                break
+                            except Exception as exc:
+                                seg['tts_error'] = str(exc)
+                                self.log.emit(f"Error en segmento {i+1}, intento {attempt}/3: {exc}")
+                                if isinstance(exc, ValueError) and 'requiere una velocidad' in str(exc) and attempt < 3:
+                                    self.log.emit(f"Reparando traducción del segmento {i+1} desde el texto original...")
+                                    corrected = self._repair_segment_text(seg, text)
+                                    if corrected:
+                                        self.log.emit(f"Texto propuesto para segmento {i+1}: {corrected}")
+                                        text = corrected
+                                        continue
+                                permanent = isinstance(exc, ValueError) or any(code in str(exc) for code in (
+                                    'HTTP 401', 'HTTP 402', 'HTTP 403', 'Control de aplicaciones'))
+                                if permanent or attempt == 3:
+                                    raise
+                                delay = .5 * 2**(attempt-1)
+                                self.log.emit(f"Reintentando segmento {i+1} en {delay:.1f}s...")
+                                time.sleep(delay)
+                except Exception as exc:
+                    seg.pop('tts_audio', None)
+                    seg['tts_error'] = str(exc)
+                    failures.append(i+1)
+                    checkpoint_dirty = True
+                    self.log.emit(f"Segmento {i+1} pendiente: {exc}")
+                    consecutive_failures += 1
+                    if any(code in str(exc) for code in ('HTTP 401', 'HTTP 402', 'HTTP 403', 'Control de aplicaciones')):
+                        raise RuntimeError(f"Proceso detenido en segmento {i+1}: {exc}. "
+                                           "Corrija el acceso o los créditos antes de reintentar. "
+                                           "Las voces válidas se conservaron.") from exc
+                    if consecutive_failures >= 5:
+                        raise RuntimeError("Se detuvo la generación tras cinco segmentos fallidos consecutivos. "
+                                           "Revise el proveedor y los errores registrados antes de reintentar. "
+                                           "Las voces válidas se conservaron.") from exc
+                self.progress.emit(int((i+1) / total * 100))
+                if checkpoint_dirty and ((failures and failures[-1] == i+1) or (i+1) % 10 == 0):
+                    self._save_checkpoint()
+                    checkpoint_dirty = False
+            self._save_checkpoint()
             if failures:
-                raise RuntimeError(f"No se generaron voces para los segmentos {failures}. Genere todas las voces antes de crear el video.")
-            if not any(s.get("tts_audio") for s in self.segments):
+                raise RuntimeError(
+                    f"Quedaron pendientes los segmentos {failures}. Las voces correctas se conservaron. "
+                    "Pulse 'Generar Voces' para reintentar solo los pendientes. Si la frase no cabe, "
+                    "acorte su Texto Final y reintente. Consulte el registro y tts_progreso.json en " + self.temp_dir)
+            if not any(s.get('tts_audio') for s in self.segments):
                 raise RuntimeError("No hay texto traducido para generar las voces.")
-            self.log.emit("Generación de voces completada.")
+            self.log.emit(f"Generación completada; {reused} voces válidas reutilizadas.")
             self.finished.emit(self.segments)
-
-        except Exception as e:
+        except Exception as exc:
+            self._save_checkpoint()
             logger.exception("Error en TTSWorker")
-            self.error.emit(str(e))
+            self.error.emit(str(exc))
 
 
 class RenderWorker(QThread):

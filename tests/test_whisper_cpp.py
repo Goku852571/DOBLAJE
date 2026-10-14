@@ -134,6 +134,36 @@ class WhisperCppTests(unittest.TestCase):
         line = 'whisper_vad: vad_segment_info: orig_start: 32.48, orig_end: 44.83, vad_start: 26.30, vad_end: 38.65'
         self.assertEqual(WhisperCppEngine.parse_vad_mapping(line), (32.48, 44.83, 26.3, 38.65))
 
+    def test_application_control_block_reports_executable_and_existing_alternative(self):
+        import wave
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for name in ('whisper-cli.exe', 'model.bin', 'vad.bin'):
+                (root / name).touch()
+            audio = root / 'audio.wav'
+            with wave.open(str(audio), 'wb') as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(16000)
+                stream.writeframes(b'\x00\x00' * 160)
+            engine = WhisperCppEngine(str(root / 'whisper-cli.exe'), str(root / 'model.bin'), str(root / 'vad.bin'))
+            blocked = OSError('Una directiva de Control de aplicaciones bloqueó este archivo')
+            blocked.winerror = 4551
+            with patch('core.whisper_cpp_engine.subprocess.Popen', side_effect=blocked) as launch:
+                with self.assertRaises(RuntimeError) as caught:
+                    engine.extract_audio_text(str(audio))
+                message = str(caught.exception)
+                self.assertIn(str(root / 'whisper-cli.exe'), message)
+                self.assertIn('Faster Whisper (local)', message)
+                self.assertIn('CodeIntegrity/Operational', message)
+                self.assertIs(caught.exception.__cause__, blocked)
+                launch.assert_called_once()
+            unrelated = OSError('Otro error de proceso')
+            with patch('core.whisper_cpp_engine.subprocess.Popen', side_effect=unrelated):
+                with self.assertRaises(OSError) as caught:
+                    engine.extract_audio_text(str(audio))
+                self.assertIs(caught.exception, unrelated)
+
 
 if __name__ == '__main__':
     unittest.main()

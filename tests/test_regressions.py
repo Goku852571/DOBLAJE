@@ -20,6 +20,8 @@ def ollama_translator_class():
     )
     namespace = dict(
         json=json, re=re, List=list, Dict=dict,
+        ENGLISH_MARKERS=ast.literal_eval(next(node.value for node in tree.body
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "ENGLISH_MARKERS" for target in node.targets))),
         Optional=__import__('typing').Optional,
         logger=SimpleNamespace(
             info=lambda *args, **kwargs: None,
@@ -78,11 +80,18 @@ class RegressionTests(unittest.TestCase):
 
     def test_translation_prompts_require_spanish_not_english(self):
         source = (ROOT / 'core/ollama_translator.py').read_text(encoding='utf-8')
+        gui_source = (ROOT / 'gui/main_window.py').read_text(encoding='utf-8')
         self.assertIn('español latino neutro', source)
         self.assertIn('prohibido responder en inglés', source.lower())
         self.assertIn('No uses inglés', source)
         self.assertIn('doblaje profesional', source)
         self.assertIn('máximo de palabras', source)
+        self.assertIn('nombres latinos', source)
+        self.assertIn('yuanes', source)
+        self.assertIn('dólares', source)
+        self.assertIn('nombres latinos', gui_source)
+        self.assertIn('yuanes', gui_source)
+        self.assertIn('dólares', gui_source)
 
     def test_missing_contextual_lines_use_individual_translation(self):
         cls = ollama_translator_class()

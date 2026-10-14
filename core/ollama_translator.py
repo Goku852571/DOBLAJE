@@ -142,7 +142,7 @@ class OllamaTranslator:
             return []
 
     def _post_generate(self, model: str, system: str, prompt: str,
-                       temperature: float, num_predict: int = 512) -> str:
+                       temperature: float, num_predict: int = 512, response_format=None) -> str:
         """
         Envía un POST a /api/generate con reintentos (hasta 3 intentos
         con pausas crecientes). Devuelve el texto del campo 'response'.
@@ -159,6 +159,9 @@ class OllamaTranslator:
             }
         }
 
+        if response_format is not None:
+            payload['format'] = response_format
+            payload['options']['num_ctx'] = 8192
         last_error: Optional[str] = None
         for attempt in range(MAX_RETRIES):
             try:
@@ -173,6 +176,8 @@ class OllamaTranslator:
                     )
 
                 result = resp.json()
+                if result.get('done_reason') == 'length':
+                    raise RuntimeError('Ollama truncó la respuesta por el límite de tokens.')
                 text = result.get('response', '').strip()
                 if not text:
                     raise RuntimeError("Ollama devolvió una respuesta vacía")
@@ -227,7 +232,10 @@ class OllamaTranslator:
             "Eres un traductor profesional para doblaje. Traduce siempre al "
             "español latino neutro, aunque el usuario pida otro idioma o el "
             "texto fuente contenga chino, inglés u otros idiomas. Está "
-            "prohibido responder en inglés. Devuelve únicamente el texto "
+            "prohibido responder en inglés. Analiza y utiliza nombres latinos "
+            "en lugar de nombres chinos, manteniendo la consistencia (como miembros "
+            "de la misma familia). Realiza la conversión monetaria: cuando hablen "
+            "de yuanes, conviértelos a dólares. Devuelve únicamente el texto "
             "traducido en español, sin explicaciones adicionales."
         )
         prompt = text
@@ -264,7 +272,10 @@ class OllamaTranslator:
             "adapta el texto al español latino neutro natural, como una frase "
             "que un narrador profesional diría en voz alta. No hagas traducción "
             "literal si suena rara; conserva la intención. Usa frases breves, "
-            "claras y fluidas. Está prohibido responder en inglés. Devuelve "
+            "claras y fluidas. Analiza y utiliza nombres latinos en lugar de nombres "
+            "chinos, manteniendo la consistencia (como miembros de la misma familia). "
+            "Realiza la conversión monetaria correspondiente: cuando hablen de yuanes, "
+            "conviértelos a dólares. Está prohibido responder en inglés. Devuelve "
             "solo la línea final en español, sin explicación."
         )
         translated = self._post_generate(
@@ -288,7 +299,33 @@ class OllamaTranslator:
             )
         return translated
 
-    def translate_segments_contextual(self, segments: List[Dict]) -> List[str]:
+    def translate_segments_contextual(self, segments: List[Dict], progress_callback=None) -> List[str]:
+        """Procesa bloques acotados con contexto de los anteriores, sin perder el orden."""
+        result, offset, context = [], 0, ''
+        while offset < len(segments):
+            end, characters = offset, 0
+            while end < len(segments) and end-offset < 24:
+                seg = segments[end]
+                source = seg.get('source_text', '').strip() or seg.get('asr_text', '').strip() or seg.get('final_text', '').strip()
+                if end > offset and characters + len(source) > 2000:
+                    break
+                characters += len(source)
+                end += 1
+            logger.info("Traducción contextual: segmentos %d–%d de %d.", offset+1, end, len(segments))
+            batch = self._translate_contextual_batch(segments[offset:end], context)
+            result.extend(batch)
+            # Mantener nombres y continuidad reciente sin reenviar todo el guion.
+            context_lines = []
+            for seg, translated in zip(segments[max(0, end-6):end], result[max(0, end-6):end]):
+                source = seg.get('source_text', '') or seg.get('asr_text', '')
+                context_lines.append(f"{source[:120]} -> {translated[:120]}")
+            context = '\n'.join(context_lines)[-1200:]
+            offset = end
+            if progress_callback:
+                progress_callback(offset, len(segments), list(result))
+        return result
+
+    def _translate_contextual_batch(self, segments: List[Dict], context: str = '') -> List[str]:
         """Traduce segmentos usando el guion completo como contexto.
 
         Devuelve una traducción por segmento, en el mismo orden. Si el modelo
@@ -307,7 +344,7 @@ class OllamaTranslator:
         if not any(sources):
             return [""] * len(segments)
 
-        cache_key = "\n".join(f"{i + 1}. {text}" for i, text in enumerate(sources))
+        cache_key = json.dumps(["contextual_v2", sources, [(s.get("start"), s.get("end")) for s in segments], context], ensure_ascii=False)
         if cache_key in self.cache:
             return self.cache[cache_key]
 
@@ -326,7 +363,11 @@ class OllamaTranslator:
             "línea para que suene natural al oído, como doblaje profesional, "
             "no como traducción literal. Puedes reordenar, resumir o cambiar "
             "palabras si conservas la intención. Evita frases torpes, rígidas "
-            "o calcadas del inglés/chino. Usa puntuación natural para la voz. "
+            "o calcadas del inglés/chino. Analiza y utiliza nombres latinos en "
+            "lugar de nombres chinos, manteniendo la consistencia en todo el guion "
+            "(como personajes de la misma familia que deben mantener coherencia de "
+            "apellidos o parentesco). Realiza la conversión monetaria correspondiente: "
+            "cuando hablen de yuanes, conviértelos a dólares. Usa puntuación natural para la voz. "
             "Respeta el límite máximo de palabras indicado en cada línea para "
             "que la voz no tenga que acelerarse demasiado. Si una línea dura "
             "menos de 1.5 segundos, hazla muy corta. Si está marcada como "
@@ -341,47 +382,39 @@ class OllamaTranslator:
             "Adapta TODO al español latino neutro natural para doblaje. No uses "
             "inglés en ninguna línea de salida. No traduzcas palabra por palabra "
             "si suena artificial. Prioriza claridad, ritmo y naturalidad oral.\n"
+            "Analiza y utiliza nombres latinos en lugar de nombres chinos manteniendo "
+            "consistencia familiar. Haz la conversión monetaria de yuanes a dólares.\n"
             "Devuelve exactamente este formato, sin markdown ni explicación:\n"
             '[{"id":1,"text":"traducción 1"},{"id":2,"text":"traducción 2"}]'
         )
 
-        try:
-            response = self._post_generate(
-                model=ANALYSIS_MODEL,
-                system=system,
-                prompt=prompt,
-                temperature=DUBBING_TEMPERATURE,
-                num_predict=max(1024, len(sources) * 96)
-            )
-            translations = self._parse_segment_translations(response, len(sources))
-            if self._needs_spanish_retry(translations, sources):
-                logger.warning(
-                    "La traducción contextual quedó incompleta o en inglés; reintentando en español."
-                )
-                response = self._post_generate(
-                    model=ANALYSIS_MODEL,
-                    system=system,
-                    prompt=(
-                        "La salida anterior quedó en inglés. Corrige y devuelve "
-                        "el mismo JSON, pero con TODOS los valores text en "
-                        "español latino neutro. No uses inglés.\n\n"
-                        "Guion completo numerado:\n"
-                        f"{numbered_script}"
-                    ),
-                    temperature=ANALYSIS_TEMPERATURE,
-                    num_predict=max(1024, len(sources) * 96)
-                )
-                translations = self._parse_segment_translations(response, len(sources))
-            translations = self._fill_missing_translations(sources, translations)
-            translations = self._fit_translations_to_durations(sources, translations, durations)
+        if context:
+            prompt = "Contexto anterior (solo referencia; no devolver estas líneas):\n" + context + "\n\n" + prompt
+        schema = {"type": "array", "minItems": len(sources), "maxItems": len(sources),
+                  "items": {"type": "object", "properties": {
+                      "id": {"type": "integer", "minimum": 1, "maximum": len(sources)},
+                      "text": {"type": "string"}}, "required": ["id", "text"], "additionalProperties": False}}
+        translations = [''] * len(sources)
+        for attempt in range(2):
+            try:
+                response = self._post_generate(model=ANALYSIS_MODEL, system=system,
+                    prompt=prompt if attempt == 0 else prompt + "\nCorrige la salida: incluye cada id una sola vez, con text en español y JSON completo. No uses inglés.",
+                    temperature=DUBBING_TEMPERATURE if attempt == 0 else ANALYSIS_TEMPERATURE,
+                    num_predict=min(3072, max(1024, len(sources)*96)), response_format=schema)
+                candidate = self._parse_segment_translations(response, len(sources))
+                for index, text in enumerate(candidate):
+                    if sources[index] and text and not self._looks_english(text) and not re.search(r'[\u3400-\u9fff]', text):
+                        translations[index] = text
+                if not self._needs_spanish_retry(translations, sources):
+                    break
+                logger.warning("Bloque incompleto; reintentando sin descartar traducciones válidas.")
+            except Exception as exc:
+                logger.warning("Respuesta contextual inválida, intento %d/2: %s", attempt+1, exc)
+        translations = self._fill_missing_translations(sources, translations)
+        translations = self._fit_translations_to_durations(sources, translations, durations)
+        if not self._needs_spanish_retry(translations, sources):
             self.cache[cache_key] = translations
-            return translations
-        except Exception as exc:
-            logger.warning(
-                "Traducción contextual falló; usando Qwen línea por línea: %s",
-                exc
-            )
-            return [self.translate_with_qwen(text) if text else "" for text in sources]
+        return translations
 
     def _parse_segment_translations(self, response: str, expected_count: int) -> List[str]:
         text = response.strip()
@@ -412,19 +445,18 @@ class OllamaTranslator:
             raise ValueError("La respuesta contextual no es una lista JSON.")
 
         translations = [""] * expected_count
-        for index, item in enumerate(data):
-            if isinstance(item, dict):
-                line_id = item.get("id", index + 1)
-                translated = str(item.get("text", "")).strip()
-            else:
-                line_id = index + 1
-                translated = str(item).strip()
-            try:
-                position = int(line_id) - 1
-            except (TypeError, ValueError):
-                position = index
-            if 0 <= position < expected_count:
-                translations[position] = translated
+        seen = set()
+        for item in data:
+            if not isinstance(item, dict) or not isinstance(item.get('text'), str):
+                raise ValueError("Cada traducción debe contener id y text válido.")
+            line_id = item.get('id')
+            if isinstance(line_id, bool) or not (isinstance(line_id, int) or isinstance(line_id, str) and line_id.isdigit()):
+                raise ValueError("Id de traducción inválido.")
+            position = int(line_id)-1
+            if not 0 <= position < expected_count or position in seen:
+                raise ValueError("Id de traducción duplicado o fuera de rango.")
+            seen.add(position)
+            translations[position] = item['text'].strip()
 
         if len(translations) != expected_count or not any(translations):
             raise ValueError("La respuesta contextual no contiene traducciones útiles.")
@@ -434,21 +466,22 @@ class OllamaTranslator:
         """Intenta extraer traducciones de texto plano numerado como '1. texto'."""
         lines = response.strip().split("\n")
         translations = [""] * expected_count
-        found = 0
+        found = set()
 
         for line in lines:
             line = line.strip()
             # Buscar patrones como "1. texto", "1) texto", "- texto", etc.
-            match = re.match(r"^(?:\d+[\.\)\]:\-])\s*(.+)$", line)
+            match = re.match(r"^(\d+)[\.\)\]:\-]\s*(.+)$", line)
             if match:
-                text = match.group(1).strip().strip('"').strip("'")
+                position = int(match.group(1))-1
+                if not 0 <= position < expected_count or position in found:
+                    raise ValueError("Id de texto numerado duplicado o fuera de rango.")
+                text = match.group(2).strip().strip('"').strip("'")
                 if text:
-                    translations[found] = text
-                    found += 1
-                    if found >= expected_count:
-                        break
+                    translations[position] = text
+                    found.add(position)
 
-        return translations if found > 0 else None
+        return translations if found else None
 
     def _looks_english(self, text: str) -> bool:
         normalized = f" {text.lower()} "
@@ -483,7 +516,14 @@ class OllamaTranslator:
                         "Qwen falló en respaldo individual del segmento %d; usando HY-MT: %s",
                         index + 1, exc
                     )
-                    completed[index] = self.translate(source)
+                    try:
+                        completed[index] = self.translate(source)
+                    except Exception as fallback_error:
+                        logger.error("Segmento %d pendiente de traducción: %s", index+1, fallback_error)
+                        completed[index] = ''
+                if self._looks_english(completed[index]) or re.search(r'[\u3400-\u9fff]', completed[index]):
+                    completed[index] = ''
+                    logger.warning("Segmento %d pendiente: la respuesta no está en español.", index+1)
         return completed
 
     def _word_budget(self, duration: float) -> int:
@@ -513,6 +553,30 @@ class OllamaTranslator:
                 logger.warning("No se pudo ajustar el segmento %d: %s", index + 1, exc)
         return fitted
 
+    def repair_for_dubbing(self, source: str, duration: float, previous: str = '') -> str:
+        """Retraduce solo la línea original; rechaza expansiones y salidas inválidas."""
+        # Es una orientación, no la prueba de que la voz cabe: esa prueba
+        # se realiza después con SAPI/API y FFmpeg, manteniendo máximo 2x.
+        budget = max(3, min(24, int(duration * 5.6) + 2))
+        system = ("Traduce únicamente la línea original al español latino neutro. "
+                  "Conserva su significado sin inventar frases ni copiar líneas vecinas. "
+                  "Usa equivalentes breves para títulos o exclamaciones. "
+                  "Devuelve solo la traducción, sin explicación ni JSON.")
+        prompt = (f"Línea original: {source}\nDuración: {duration:.3f} segundos.\n"
+                  f"Objetivo: no más de {budget} palabras. No añadas información.")
+        # HY-MT recibe únicamente el original, incluso para líneas de más de
+        # seis caracteres. La traducción errónea anterior no debe contaminarlo.
+        try:
+            candidate = self.translate_simple(source).strip().strip('"')
+        except Exception:
+            candidate = ''
+        if not candidate or candidate == previous or self._word_count(candidate) > budget:
+            candidate = self._post_generate(ANALYSIS_MODEL, system, prompt, 0.0, num_predict=96).strip().strip('"')
+        if (not candidate or '\n' in candidate or self._looks_english(candidate)
+                or re.search(r'[\u3400-\u9fff{}\[\]]', candidate) or self._word_count(candidate) > budget):
+            raise ValueError("La reparación automática no devolvió una frase breve válida en español.")
+        return candidate
+
     def _shorten_for_dubbing(self, source: str, translated: str,
                              duration: float, budget: int) -> str:
         system = (
@@ -536,7 +600,7 @@ class OllamaTranslator:
             temperature=DUBBING_TEMPERATURE,
             num_predict=128
         ).strip()
-        return shortened if shortened and not self._looks_english(shortened) else translated
+        return shortened if shortened and not self._looks_english(shortened) and not re.search(r"[\u3400-\u9fff]", shortened) else translated
 
     def analyze(self, prompt: str, system: Optional[str] = None) -> str:
         """

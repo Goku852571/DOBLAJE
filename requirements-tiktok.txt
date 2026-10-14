@@ -1,0 +1,2 @@
+# Compatibility entry point: all dependencies are now part of Video_Sub.
+-r requirements.txt

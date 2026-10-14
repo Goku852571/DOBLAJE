@@ -52,7 +52,7 @@ class SapiTTSProvider:
                    "-EncodedCommand", _encoded_powershell(script)]
         # System.Speech accesses voices from the interactive Windows session.
         # A hidden, detached process cannot reliably enumerate Vocalizer voices.
-        return subprocess.run(command, capture_output=True, text=True, check=False, env=env)
+        return subprocess.run(command, capture_output=True, text=True, check=False, env=env, timeout=120)
 
     def synthesize(self, text: str, output_path: str, voice_id: str = "",
                    target_duration: Optional[float] = None,
@@ -87,6 +87,10 @@ class SapiTTSProvider:
             if log:
                 log(f"Sintetización completada con: {result.stdout.strip()}")
             return True
+        except subprocess.TimeoutExpired:
+            if log:
+                log("La síntesis SAPI superó 120 segundos; se podrá reintentar este segmento.")
+            return False
         except OSError as exc:
             if log:
                 log(f"Error al crear el audio local: {exc}")

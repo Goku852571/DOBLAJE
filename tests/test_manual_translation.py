@@ -136,8 +136,10 @@ class ManualTranslationTests(unittest.TestCase):
                              join=__import__('os').path.join, exists=lambda path: True)),
                          config_manager=SimpleNamespace(get=lambda key, default=None: "faster_whisper" if key == "asr_engine" else default),
                          clear_segment_tts=load_source('media', {}).clear_segment_tts,
-                         get_audio_duration=lambda path: 1.0, time_stretch_audio=Mock(return_value=True),
+                         get_audio_duration=lambda path: fitted.get(path, 1.0),
+                         time_stretch_audio=Mock(side_effect=lambda raw, duration, output, **kwargs: fitted.setdefault(output, duration) > 0),
                          logger=logging.getLogger('manual_tts_test'))
+        fitted = {}
         worker_cls = load_class('gui/workers.py', 'TTSWorker', namespace)
         worker = worker_cls(self.window.segments, 'temporary')
         with patch.dict('sys.modules', {'core.tts_provider': module}):

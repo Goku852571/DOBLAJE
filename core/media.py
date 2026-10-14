@@ -95,7 +95,7 @@ def extract_audio(video_path: str, output_path: str, for_mixing: bool = False) -
     rate = 48000 if for_mixing else 16000
     cmd = [
         _ffmpeg_binary(), "-y", "-err_detect", "ignore_err", "-i", video_path,
-        "-map", "0:a:0", "-vn", "-async", "1",
+        "-map", "0:a:0", "-vn", "-af", "aresample=async=1:first_pts=0",
         "-acodec", "pcm_s16le", "-ar", str(rate), "-ac", "2" if for_mixing else "1",
         output_path
     ]
@@ -238,6 +238,9 @@ def time_stretch_audio(input_path: str, target_duration: float, output_path: str
                     f"Silencio inicial eliminado: {trimmed['leading_silence']:.3f}s.")
         return True
     except (subprocess.CalledProcessError, OSError, ValueError, wave.Error) as exc:
+        if fit_info is not None:
+            fit_info.update(error=str(getattr(exc, "stderr", None) or exc),
+                            retryable=not isinstance(exc, ValueError))
         logger.error("Error sincronizando voz: %s", getattr(exc, "stderr", None) or exc)
         return False
 

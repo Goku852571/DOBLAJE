@@ -154,3 +154,12 @@ descarga metadata.audio_url y convierte a WAV PCM16 mono 48 kHz con FFmpeg.
 Cada segmento conserva el ajuste temporal existente. Velocidad API: 0.5–1.5.
 Los errores 429/503 se reintentan con espera y el proceso tiene un límite de
 10 minutos por segmento. La generación consume los créditos de tu cuenta.
+
+## TikTok integrado
+
+El botón **Descargar videos de TikTok y doblar** admite la URL inicial de una
+serie, un archivo .txt o un video individual. El código, el perfil y los datos
+pertenecen a Video_Sub y no dependen de otra aplicación. Permite reanudar,
+cancelar y continuar automáticamente con el doblaje existente.
+Consulta [INTEGRACION_TIKTOK.md](INTEGRACION_TIKTOK.md) para instalación,
+sesión de Chrome, rutas relativas y pruebas en Windows.
